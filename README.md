@@ -8,9 +8,9 @@ Neo is a Chrome extension that passively captures every API call your browser ma
 
 AI agents operating web apps today have two options, both bad:
 
-| Approach | Pain |
-|----------|------|
-| **Official APIs** | Most SaaS doesn't have one, or only exposes 10% of features |
+| Approach               | Pain                                                               |
+| ---------------------- | ------------------------------------------------------------------ |
+| **Official APIs**      | Most SaaS doesn't have one, or only exposes 10% of features        |
 | **Browser automation** | Screenshot → OCR → click. Slow, fragile, breaks on every UI change |
 
 **Neo is the third way.** Every web app already has a complete internal API — the frontend calls it every time you click something. Neo captures those calls and makes them replayable.
@@ -48,7 +48,11 @@ Load the extension:
 1. Open `chrome://extensions`
 2. Enable "Developer mode"
 3. Click "Load unpacked" → select `extension/dist/`
-4. Browse any website — Neo starts capturing immediately
+4. **Important:** Copy the generated Extension ID (e.g., `dfgodilhpdcalfijfebibl...`) and export it as an environment variable so the CLI can find it:
+   ```bash
+   export NEO_EXTENSION_ID="your_extension_id_here"
+   ```
+5. Browse any website — Neo starts capturing immediately
 
 ## CLI Tools
 
@@ -295,14 +299,14 @@ Neo runs entirely locally — no external servers, no telemetry, no data leaves 
 
 **What you should know:**
 
-| Aspect | Detail |
-|--------|--------|
-| **Capture scope** | `<all_urls>` — Neo sees traffic on *every* website, including banking, email, medical portals |
-| **Content script** | Runs in `MAIN` world (shares JS context with pages) to intercept fetch/XHR |
-| **CDP port** | CLI requires Chrome on port 9222 — any local process can connect to this port |
-| **Response bodies** | Stored in IndexedDB (truncated to 100KB) — may contain personal data from API responses |
-| **Schema files** | Store only endpoint structure (paths, header names, response shapes) — no credentials or user data |
-| **Export** | `neo capture export` redacts auth by default; `--include-auth` requires explicit opt-in |
+| Aspect              | Detail                                                                                             |
+| ------------------- | -------------------------------------------------------------------------------------------------- |
+| **Capture scope**   | `<all_urls>` — Neo sees traffic on *every* website, including banking, email, medical portals      |
+| **Content script**  | Runs in `MAIN` world (shares JS context with pages) to intercept fetch/XHR                         |
+| **CDP port**        | CLI requires Chrome on port 9222 — any local process can connect to this port                      |
+| **Response bodies** | Stored in IndexedDB (truncated to 100KB) — may contain personal data from API responses            |
+| **Schema files**    | Store only endpoint structure (paths, header names, response shapes) — no credentials or user data |
+| **Export**          | `neo capture export` redacts auth by default; `--include-auth` requires explicit opt-in            |
 
 **Recommendations:**
 
