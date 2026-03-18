@@ -124,6 +124,44 @@ function hasActiveSession(sessionName = DEFAULT_SESSION_NAME, deps = {}) {
   return !!(session && typeof session.pageWsUrl === 'string' && session.pageWsUrl.trim());
 }
 
+// For Lightpanda-style single-WS backends, each CLI invocation needs to
+// re-establish the page context (Target.createTarget + attachToTarget) since
+// the WS connection (and thus the browsing context) doesn't survive across
+// separate process runs.
+async function ensureLightpandaPageContext(sessionName = DEFAULT_SESSION_NAME) {
+  const session = getSession(sessionName);
+  if (!session || !session.pageWsUrl) return session;
+  // Only needed for bare WS URLs (Lightpanda), not per-tab Chrome WS URLs
+  if (!/^wss?:\/\/[^/]+\/?$/.test(session.pageWsUrl)) return session;
+
+  const pageUrl = session.currentUrl || 'about:blank';
+  const wsUrl = session.pageWsUrl;
+
+  // Create target with the saved URL and attach in one persistent connection
+  const created = await cdpSendPersistent(wsUrl, 'Target.createTarget', { url: pageUrl });
+  const targetId = created && created.targetId;
+  if (targetId) {
+    try {
+      await cdpSendPersistent(wsUrl, 'Target.attachToTarget', { targetId, flatten: true });
+    } catch {}
+  }
+
+  // Wait for the page to finish loading
+  if (pageUrl !== 'about:blank') {
+    try {
+      await cdpSendPersistent(wsUrl, 'Page.enable', {});
+      // Poll until DOM is ready (up to 5s)
+      for (let i = 0; i < 10; i++) {
+        await new Promise(r => setTimeout(r, 500));
+        const evalResult = await cdpSendPersistent(wsUrl, 'Runtime.evaluate', { expression: 'document.readyState' });
+        if (evalResult && evalResult.result && (evalResult.result.value === 'complete' || evalResult.result.value === 'interactive')) break;
+      }
+    } catch {}
+  }
+
+  return session;
+}
+
 function shellEscape(value) {
   return `'${String(value || '').replace(/'/g, `'\\''`)}'`;
 }
@@ -156,6 +194,11 @@ function resolveCommandPath(commandName, deps = {}) {
   }
 }
 
+function detectLightpandaBinaryPath(deps = {}) {
+  const resolveCommandPathFn = typeof deps.resolveCommandPath === 'function' ? deps.resolveCommandPath : resolveCommandPath;
+  return resolveCommandPathFn('lightpanda');
+}
+
 function detectChromeBinaryPath(deps = {}) {
   const resolveCommandPathFn = typeof deps.resolveCommandPath === 'function' ? deps.resolveCommandPath : resolveCommandPath;
   const existsSyncFn = typeof deps.existsSync === 'function' ? deps.existsSync : fs.existsSync;
@@ -173,6 +216,12 @@ function detectChromeBinaryPath(deps = {}) {
   }
 
   return null;
+}
+
+function isLightpandaBrowser(configOrPath) {
+  if (!configOrPath) return false;
+  const p = typeof configOrPath === 'string' ? configOrPath : (configOrPath.browserType || configOrPath.chromePath || '');
+  return p === 'lightpanda' || /lightpanda/i.test(p);
 }
 
 function copyDirectoryRecursive(sourceDir, destinationDir, deps = {}) {
@@ -534,7 +583,24 @@ async function clearSessionCaptures(sessionName = DEFAULT_SESSION_NAME, domain =
 async function findTab(pattern, deps = {}) {
   const fetchFn = typeof deps.fetch === 'function' ? deps.fetch : fetch;
   const cdpUrl = deps.cdpUrl || CDP_URL;
-  const tabs = await (await fetchFn(`${cdpUrl}/json/list`)).json();
+  let tabs;
+  try {
+    tabs = await (await fetchFn(`${cdpUrl}/json/list`)).json();
+  } catch {
+    // Lightpanda: no /json/list — synthesize from session + re-bootstrap context
+    const session = getSession(DEFAULT_SESSION_NAME);
+    if (session && session.pageWsUrl && /^wss?:\/\/[^/]+\/?$/.test(session.pageWsUrl)) {
+      await ensureLightpandaPageContext(DEFAULT_SESSION_NAME);
+      return {
+        id: session.tabId || 'lightpanda',
+        type: 'page',
+        title: '',
+        url: session.currentUrl || 'about:blank',
+        webSocketDebuggerUrl: session.pageWsUrl,
+      };
+    }
+    throw new Error(`No tabs found (${cdpUrl}/json/list unavailable)`);
+  }
   if (pattern) {
     const tab = tabs.find(t => t.type === 'page' && t.url.includes(pattern));
     if (!tab) throw new Error(`No tab matching "${pattern}"`);
@@ -545,7 +611,76 @@ async function findTab(pattern, deps = {}) {
   return pages[0];
 }
 
+// Persistent WebSocket pool for CDP backends that multiplex on a single connection
+// (e.g. Lightpanda). Chrome uses per-tab WS URLs so each connection is independent.
+const _persistentWsPool = {};
+let _persistentWsIdCounter = 1;
+
+function cdpSendPersistent(wsUrl, method, params = {}, timeout = 10000) {
+  return new Promise((resolve, reject) => {
+    if (!wsUrl) { reject(new Error('Missing WebSocket URL')); return; }
+    if (!method) { reject(new Error('Missing CDP method')); return; }
+
+    let entry = _persistentWsPool[wsUrl];
+    if (entry && (entry.ws.readyState === WebSocket.CLOSING || entry.ws.readyState === WebSocket.CLOSED)) {
+      delete _persistentWsPool[wsUrl];
+      entry = null;
+    }
+
+    const sendMessage = (ws) => {
+      const id = _persistentWsIdCounter++;
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        reject(new Error(`CDP timeout: ${method}`));
+      }, timeout);
+      const handler = (raw) => {
+        let msg;
+        try { msg = JSON.parse(raw.toString()); } catch { return; }
+        if (msg.id !== id) return;
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        ws.removeListener('message', handler);
+        if (msg.error) reject(new Error(`CDP ${method} failed: ${msg.error.message || 'Unknown error'}`));
+        else resolve(msg.result);
+      };
+      ws.on('message', handler);
+      const message = { id, method, params: params || {} };
+      ws.send(JSON.stringify(message));
+    };
+
+    if (entry && entry.ws.readyState === WebSocket.OPEN) {
+      sendMessage(entry.ws);
+    } else {
+      // Create new persistent connection
+      const ws = new WebSocket(wsUrl);
+      const connectTimer = setTimeout(() => {
+        try { ws.close(); } catch {}
+        reject(new Error(`CDP connect timeout: ${wsUrl}`));
+      }, timeout);
+      ws.on('open', () => {
+        clearTimeout(connectTimer);
+        _persistentWsPool[wsUrl] = { ws };
+        sendMessage(ws);
+      });
+      ws.on('error', (err) => {
+        clearTimeout(connectTimer);
+        delete _persistentWsPool[wsUrl];
+        reject(err);
+      });
+    }
+  });
+}
+
 function cdpSend(pageWsUrl, method, params = {}, timeout = 10000) {
+  // Use persistent connection for Lightpanda-style single-WS backends
+  // Detected by: URL does not contain a target/page-specific path segment
+  if (pageWsUrl && /^wss?:\/\/[^/]+\/?$/.test(pageWsUrl)) {
+    return cdpSendPersistent(pageWsUrl, method, params, timeout);
+  }
+  // Chrome: per-tab WS URL, create a fresh connection each time
   return new Promise((resolve, reject) => {
     if (!pageWsUrl) {
       reject(new Error('Missing page WebSocket URL'));
@@ -576,11 +711,7 @@ function cdpSend(pageWsUrl, method, params = {}, timeout = 10000) {
     }
 
     ws.on('open', () => {
-      const message = { id, method };
-      if (params && Object.keys(params).length > 0) {
-        message.params = params;
-      }
-      ws.send(JSON.stringify(message));
+      ws.send(JSON.stringify({ id, method, params: params || {} }));
     });
 
     ws.on('message', (raw) => {
@@ -2285,16 +2416,52 @@ function getDevToolsActivePort() {
 async function connectToCdpPort(port, sessionName = DEFAULT_SESSION_NAME) {
   const cdpUrl = `http://localhost:${port}`;
   const versionInfo = await fetchJsonOrThrow(`${cdpUrl}/json/version`);
-  const targets = await fetchJsonOrThrow(`${cdpUrl}/json/list`);
-  const page = targets.find(target => target.type === 'page');
-  if (!page) {
+
+  // Try standard Chrome /json/list first; fall back to Lightpanda-style
+  // browser-level WebSocket with Target.createTarget
+  let tabId = '';
+  let page = {};
+  let pageWsUrl = '';
+
+  try {
+    const targets = await fetchJsonOrThrow(`${cdpUrl}/json/list`);
+    const found = targets.find(target => target.type === 'page');
+    if (found) {
+      tabId = found.id || found.targetId || '';
+      page = found;
+      pageWsUrl = found.webSocketDebuggerUrl || '';
+    }
+  } catch {
+    // /json/list not available (e.g. Lightpanda) — use browser WS endpoint
+  }
+
+  if (!pageWsUrl && versionInfo.webSocketDebuggerUrl) {
+    // Lightpanda / minimal CDP: create a target via the browser-level WS
+    const browserWsUrl = versionInfo.webSocketDebuggerUrl;
+    const created = await cdpSend(browserWsUrl, 'Target.createTarget', { url: 'about:blank' });
+    const targetId = created && created.targetId;
+    if (targetId) {
+      // Lightpanda needs attachToTarget to activate the session
+      try {
+        await cdpSend(browserWsUrl, 'Target.attachToTarget', { targetId, flatten: true });
+      } catch {
+        // Some CDP servers don't require explicit attach
+      }
+      tabId = targetId;
+      pageWsUrl = browserWsUrl; // Lightpanda multiplexes on the same WS
+      page = { id: targetId, title: '', url: 'about:blank', type: 'page', webSocketDebuggerUrl: browserWsUrl };
+    } else {
+      throw new Error(`Connected to ${cdpUrl} but failed to create a page target`);
+    }
+  }
+
+  if (!pageWsUrl) {
     throw new Error(`Connected to ${cdpUrl} but no page target found`);
   }
 
-  const tabId = page.id || page.targetId || '';
   setSession(sessionName, {
     cdpUrl,
-    pageWsUrl: page.webSocketDebuggerUrl || '',
+    pageWsUrl,
     tabId,
     refs: {},
   });
@@ -2342,7 +2509,16 @@ function updateSessionTab(sessionName, cdpUrl, target) {
 
 async function listSessionTargets(sessionName = DEFAULT_SESSION_NAME) {
   const cdpUrl = getSessionCdpUrl(sessionName);
-  const targets = parseTabTargets(await fetchJsonOrThrow(`${cdpUrl}/json/list`));
+  let targets;
+  try {
+    targets = parseTabTargets(await fetchJsonOrThrow(`${cdpUrl}/json/list`));
+  } catch {
+    // Lightpanda: no /json/list — synthesize from current session
+    const session = getSession(sessionName);
+    targets = session && session.tabId
+      ? [{ index: 0, type: 'page', id: session.tabId, title: '', url: '', webSocketDebuggerUrl: session.pageWsUrl || '' }]
+      : [];
+  }
   return { cdpUrl, targets };
 }
 
@@ -2476,8 +2652,10 @@ commands.setup = async function(args) {
   const setupSchemaDir = path.join(homeDir, 'schemas');
 
   const chromePath = detectChromeBinaryPath();
-  if (!chromePath) {
-    throw new Error('Chrome binary not found. Tried: google-chrome-stable, google-chrome, chromium-browser, chromium');
+    // Detect Lightpanda as an alternative browser
+  const lightpandaPath = detectLightpandaBinaryPath();
+  if (!chromePath && !lightpandaPath) {
+    throw new Error('No supported browser found. Tried: google-chrome-stable, google-chrome, chromium-browser, chromium, lightpanda');
   }
 
   const projectRoot = path.join(fs.realpathSync(__dirname), '..');
@@ -2489,23 +2667,36 @@ commands.setup = async function(args) {
 
   // Detect user-data-dir from running Chrome process
   let detectedUserDataDir = null;
-  try {
-    const { execSync: es } = require('child_process');
-    const psOut = es('ps aux', { encoding: 'utf8', timeout: 3000 });
-    for (const line of psOut.split('\n')) {
-      if (/chrome.*--remote-debugging-port/.test(line)) {
-        const m = line.match(/--user-data-dir=(\S+)/);
-        if (m) { detectedUserDataDir = m[1]; break; }
+  if (chromePath) {
+    try {
+      const { execSync: es } = require('child_process');
+      const psOut = es('ps aux', { encoding: 'utf8', timeout: 3000 });
+      for (const line of psOut.split('\n')) {
+        if (/chrome.*--remote-debugging-port/.test(line)) {
+          const m = line.match(/--user-data-dir=(\S+)/);
+          if (m) { detectedUserDataDir = m[1]; break; }
+        }
       }
-    }
-  } catch {}
+    } catch {}
+  }
 
   const config = {
-    chromePath,
+    chromePath: chromePath || lightpandaPath,
+    browserType: chromePath ? 'chrome' : 'lightpanda',
     cdpPort: 9222,
   };
   if (detectedUserDataDir) config.userDataDir = detectedUserDataDir;
   if (profileName) config.profile = profileName;
+
+  if (lightpandaPath) {
+    console.log(`Lightpanda detected: ${lightpandaPath}`);
+    if (chromePath) {
+      console.log(`Using Chrome as default (set browserType: "lightpanda" in config to switch)`);
+    } else {
+      console.log(`No Chrome found — using Lightpanda as browser backend`);
+    }
+  }
+
   fs.writeFileSync(configFile, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
 
   // Pre-register Neo extension in Chrome Preferences
@@ -2609,29 +2800,32 @@ commands.start = async function(args) {
     throw new Error(`Invalid config JSON: ${configFile}`);
   }
 
-  const chromePath = String(config && config.chromePath || '').trim();
+  const browserType = String(config && config.browserType || 'chrome').trim();
+  const browserPath = String(config && config.chromePath || '').trim();
   const cdpPort = parseInt(String(config && config.cdpPort !== undefined ? config.cdpPort : 9222), 10);
+  const useLightpanda = browserType === 'lightpanda' || isLightpandaBrowser(browserPath);
 
-  if (!chromePath) {
+  if (!browserPath) {
     throw new Error(`Missing chromePath in ${configFile}. Run neo setup again`);
   }
   if (!Number.isInteger(cdpPort) || cdpPort <= 0 || cdpPort > 65535) {
     throw new Error(`Invalid cdpPort in ${configFile}: ${config && config.cdpPort}`);
   }
-  if (!fs.existsSync(extensionDir)) {
+  if (!useLightpanda && !fs.existsSync(extensionDir)) {
     throw new Error(`Missing extension directory: ${extensionDir}. Run neo setup first`);
   }
-  if (chromePath.includes('/') && !fs.existsSync(chromePath)) {
-    throw new Error(`Chrome binary does not exist: ${chromePath}`);
+  if (browserPath.includes('/') && !fs.existsSync(browserPath)) {
+    throw new Error(`Browser binary does not exist: ${browserPath}`);
   }
 
-  // Check if Chrome is already running with CDP on the target port
+  // Check if browser is already running with CDP on the target port
   if (!force) {
     try {
       const resp = await fetch(`http://localhost:${cdpPort}/json/version`);
       if (resp.ok) {
         const info = await resp.json();
-        console.log(`Chrome already running with CDP on port ${cdpPort} (${info.Browser})`);
+        const label = useLightpanda ? 'Lightpanda' : 'Chrome';
+        console.log(`${label} already running with CDP on port ${cdpPort} (${info.Browser || 'Lightpanda'})`);
         console.log(`CDP endpoint: http://localhost:${cdpPort}`);
         console.log('Use --force to launch a new instance anyway.');
         return;
@@ -2641,27 +2835,33 @@ commands.start = async function(args) {
     }
   }
 
-  const userDataDir = String(config && config.userDataDir || '').trim() || path.join(homeDir, 'chrome-profile');
-  fs.mkdirSync(userDataDir, { recursive: true });
-
-  const child = spawn(chromePath, [
-    `--remote-debugging-port=${cdpPort}`,
-    `--user-data-dir=${userDataDir}`,
-    '--no-first-run',
-    '--no-default-browser-check',
-  ], {
-    detached: true,
-    stdio: 'ignore',
-  });
+  let child;
+  if (useLightpanda) {
+    // Lightpanda: headless browser — no user-data-dir, no extensions
+    const lpArgs = ['serve', '--host', '127.0.0.1', '--port', String(cdpPort)];
+    child = spawn(browserPath, lpArgs, { detached: true, stdio: 'ignore' });
+  } else {
+    // Chrome: standard launch with extension and user-data-dir
+    const userDataDir = String(config && config.userDataDir || '').trim() || path.join(homeDir, 'chrome-profile');
+    fs.mkdirSync(userDataDir, { recursive: true });
+    child = spawn(browserPath, [
+      `--remote-debugging-port=${cdpPort}`,
+      `--user-data-dir=${userDataDir}`,
+      '--no-first-run',
+      '--no-default-browser-check',
+    ], { detached: true, stdio: 'ignore' });
+  }
   child.unref();
 
-  const ready = await waitForCdpPort(cdpPort, 5000, 250);
+  const ready = await waitForCdpPort(cdpPort, useLightpanda ? 3000 : 5000, 250);
   if (!ready) {
-    console.log(`Failed to start Chrome: CDP endpoint http://localhost:${cdpPort} did not respond within 5s`);
+    const label = useLightpanda ? 'Lightpanda' : 'Chrome';
+    console.log(`Failed to start ${label}: CDP endpoint http://localhost:${cdpPort} did not respond in time`);
     process.exit(1);
   }
 
-  console.log(`Chrome started with Neo extension on port ${cdpPort}`);
+  const label = useLightpanda ? 'Lightpanda' : 'Chrome';
+  console.log(`${label} started on port ${cdpPort}`);
   console.log(`CDP endpoint: http://localhost:${cdpPort}`);
 };
 
@@ -2788,7 +2988,14 @@ commands.attach = async function(args, context = {}) {
   console.log(`Session: ${sessionName}`);
 
   // List all open tabs
-  const targets = parseTabTargets(await fetchJsonOrThrow(`http://localhost:${port}/json/list`));
+  let targets;
+  try {
+    targets = parseTabTargets(await fetchJsonOrThrow(`http://localhost:${port}/json/list`));
+  } catch {
+    targets = connected.tabId
+      ? [{ index: 0, type: 'page', id: connected.tabId, title: connected.page.title || '', url: connected.page.url || '', webSocketDebuggerUrl: '' }]
+      : [];
+  }
   const pages = targets.filter(t => t.type === 'page');
   if (pages.length > 0) {
     console.log(`\nOpen tabs (${pages.length}):`);
@@ -3002,6 +3209,7 @@ commands.snapshot = async function(args, context = {}) {
     process.exit(1);
   }
 
+  await ensureLightpandaPageContext(sessionName);
   await cdpSend(session.pageWsUrl, 'Accessibility.enable');
   const treeResult = await cdpSend(session.pageWsUrl, 'Accessibility.getFullAXTree');
   const assigned = assignRefs(treeResult && Array.isArray(treeResult.nodes) ? treeResult.nodes : []);
@@ -4918,12 +5126,64 @@ commands.eval = async function(args) {
 };
 
 // neo open <url>
-commands.open = async function(args) {
+commands.open = async function(args, context = {}) {
   const url = args[0];
   if (!url) { console.error('Usage: neo open <url>'); process.exit(1); }
-  const res = await fetch(`${CDP_URL}/json/new?${url}`, { method: 'PUT' });
-  const tab = await res.json();
-  console.log(`Opened: ${tab.url}`);
+
+  const sessionName = (context && context.sessionName) || DEFAULT_SESSION_NAME;
+  const session = getSession(sessionName);
+  const cdpUrl = (session && session.cdpUrl) || CDP_URL;
+
+  // Detect if backend supports /json/list (Chrome) or not (Lightpanda)
+  let usedChromeEndpoint = false;
+  try {
+    const listResp = await fetch(`${cdpUrl}/json/new?${url}`, { method: 'PUT' });
+    const tab = await listResp.json();
+    if (tab && tab.url) {
+      console.log(`Opened: ${tab.url}`);
+      usedChromeEndpoint = true;
+
+      // Update session to point to the new tab
+      if (tab.webSocketDebuggerUrl) {
+        setSession(sessionName, {
+          ...(session || {}),
+          cdpUrl,
+          pageWsUrl: tab.webSocketDebuggerUrl,
+          tabId: tab.id || tab.targetId || '',
+          currentUrl: tab.url || url,
+          refs: {},
+        });
+      }
+    }
+  } catch {
+    // /json/new not available
+  }
+
+  if (!usedChromeEndpoint) {
+    // Lightpanda path: create a new target with the URL
+    const versionInfo = await fetchJsonOrThrow(`${cdpUrl}/json/version`);
+    const browserWsUrl = versionInfo.webSocketDebuggerUrl;
+    if (!browserWsUrl) {
+      throw new Error(`Cannot open URL: no browser WebSocket endpoint available`);
+    }
+    const created = await cdpSend(browserWsUrl, 'Target.createTarget', { url });
+    const targetId = created && created.targetId;
+    if (!targetId) {
+      throw new Error(`Failed to create target for ${url}`);
+    }
+    // Attach to get a session
+    try {
+      await cdpSend(browserWsUrl, 'Target.attachToTarget', { targetId, flatten: true });
+    } catch {}
+    setSession(sessionName, {
+      cdpUrl,
+      pageWsUrl: browserWsUrl,
+      tabId: targetId,
+      currentUrl: url,
+      refs: {},
+    });
+    console.log(`Opened: ${url}`);
+  }
 };
 
 // neo replay <id> [--tab pattern] [--auto-headers]
