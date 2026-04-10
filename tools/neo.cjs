@@ -1485,7 +1485,12 @@ async function resolveRef(sessionName, ref, deps = {}) {
     throw new Error(`Failed to resolve node for ${ref}`);
   }
 
-  const boxModel = await sendFn(session.pageWsUrl, 'DOM.getBoxModel', { objectId });
+  let boxModel;
+  try {
+    boxModel = await sendFn(session.pageWsUrl, 'DOM.getBoxModel', { objectId });
+  } catch {
+    boxModel = await sendFn(session.pageWsUrl, 'DOM.getBoxModel', { backendNodeId: backendDOMNodeId });
+  }
   const quad = boxModel && boxModel.model && boxModel.model.content;
   const center = centerFromQuad(quad);
   if (!center) {

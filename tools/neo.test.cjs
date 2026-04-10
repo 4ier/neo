@@ -742,9 +742,30 @@ function centerFromQuad(quad) {
   return { x, y };
 }
 
+function debugNeoEnabled(env = process.env) {
+  const value = env && env.NEO_DEBUG;
+  if (value == null) return false;
+  return !/^(0|false|off|no)$/i.test(String(value).trim());
+}
+
+function debugNeoLog(...parts) {
+  if (!debugNeoEnabled()) return;
+  const line = parts.map((part) => {
+    if (typeof part === 'string') return part;
+    try {
+      return JSON.stringify(part);
+    } catch {
+      return String(part);
+    }
+  }).join(' ');
+  console.error(`[neo:debug] ${line}`);
+}
+
 async function resolveRef(sessionName, ref, deps = {}) {
   const getSessionFn = typeof deps.getSession === 'function' ? deps.getSession : getSession;
   const sendFn = typeof deps.cdpSend === 'function' ? deps.cdpSend : (() => Promise.reject(new Error('Missing cdpSend stub')));
+  const debugLog = typeof deps.debugLog === 'function' ? deps.debugLog : debugNeoLog;
+  const debugEnabled = deps.debugEnabled === true || (deps.debugEnabled === undefined && debugNeoEnabled());
   const normalizedSessionName = sessionName || DEFAULT_SESSION_NAME;
   const session = getSessionFn(normalizedSessionName);
   if (!session || !session.pageWsUrl) {
@@ -752,15 +773,33 @@ async function resolveRef(sessionName, ref, deps = {}) {
   }
 
   const backendDOMNodeId = getBackendNodeIdFromRef(session, ref);
+  if (debugEnabled) {
+    debugLog(`resolveRef start session=${normalizedSessionName} ref=${String(ref)} backendDOMNodeId=${backendDOMNodeId}`);
+  }
   const resolved = await sendFn(session.pageWsUrl, 'DOM.resolveNode', { backendNodeId: backendDOMNodeId });
   const objectId = resolved && resolved.object && resolved.object.objectId;
+  if (debugEnabled) {
+    debugLog(`resolveRef resolved ref=${String(ref)} objectId=${objectId || '<missing>'}`);
+  }
   if (!objectId) {
     throw new Error(`Failed to resolve node for ${ref}`);
   }
 
-  const boxModel = await sendFn(session.pageWsUrl, 'DOM.getBoxModel', { objectId });
+  let boxModel;
+  try {
+    boxModel = await sendFn(session.pageWsUrl, 'DOM.getBoxModel', { objectId });
+  } catch (error) {
+    if (debugEnabled) {
+      debugLog(`resolveRef getBoxModel(objectId) failed ref=${String(ref)} error=${error && error.message ? error.message : String(error)}`);
+      debugLog(`resolveRef retry getBoxModel backendDOMNodeId=${backendDOMNodeId}`);
+    }
+    boxModel = await sendFn(session.pageWsUrl, 'DOM.getBoxModel', { backendNodeId: backendDOMNodeId });
+  }
   const quad = boxModel && boxModel.model && boxModel.model.content;
   const center = centerFromQuad(quad);
+  if (debugEnabled) {
+    debugLog(`resolveRef boxModel ref=${String(ref)} quad=${JSON.stringify(quad || null)} center=${center ? `(${center.x},${center.y})` : '<missing>'}`);
+  }
   if (!center) {
     throw new Error(`Failed to get box model for ${ref}`);
   }
@@ -772,6 +811,7 @@ async function resolveRef(sessionName, ref, deps = {}) {
     backendDOMNodeId,
   };
 }
+
 
 function normalizeCookieDomainFilter(domain) {
   const raw = String(domain || '').trim().toLowerCase();
@@ -1579,6 +1619,51 @@ test('resolveRef returns objectId + center coordinates', async () => {
   assert.deepStrictEqual(
     calls.map(call => call.method),
     ['DOM.resolveNode', 'DOM.getBoxModel']
+  );
+});
+
+test('resolveRef falls back to backendDOMNodeId when getBoxModel by objectId fails', async () => {
+  const calls = [];
+  const fakeSession = {
+    ui: {
+      pageWsUrl: 'ws://localhost:9222/devtools/page/1',
+      refs: {
+        '1': { backendDOMNodeId: 1234 },
+      },
+    },
+  };
+  const fakeSend = async (wsUrl, method, params) => {
+    calls.push({ wsUrl, method, params });
+    if (method === 'DOM.resolveNode') {
+      return { object: { objectId: 'obj-1' } };
+    }
+    if (method === 'DOM.getBoxModel' && params && params.objectId) {
+      throw new Error('CDP DOM.getBoxModel failed: Could not find object with given id');
+    }
+    if (method === 'DOM.getBoxModel' && params && params.backendNodeId) {
+      return { model: { content: [10, 20, 30, 20, 30, 40, 10, 40] } };
+    }
+    throw new Error(`Unexpected method: ${method}`);
+  };
+
+  const result = await resolveRef('ui', '1', {
+    getSession: (name) => fakeSession[name] || null,
+    cdpSend: fakeSend,
+  });
+
+  assert.deepStrictEqual(result, {
+    objectId: 'obj-1',
+    x: 20,
+    y: 30,
+    backendDOMNodeId: 1234,
+  });
+  assert.deepStrictEqual(
+    calls.map(call => [call.method, call.params.objectId || null, call.params.backendNodeId || null]),
+    [
+      ['DOM.resolveNode', null, 1234],
+      ['DOM.getBoxModel', 'obj-1', null],
+      ['DOM.getBoxModel', null, 1234],
+    ]
   );
 });
 
@@ -2583,6 +2668,40 @@ test('parseSnapshotArgs recognizes --diff flag', () => {
 test('parseSnapshotArgs defaults diff to false', () => {
   const { options } = parseSnapshotArgs(['-i']);
   assert.strictEqual(options.diff, false);
+});
+
+test('resolveRef includes debug details when debug logging is enabled', async () => {
+  const logs = [];
+  const fakeSession = {
+    ui: {
+      pageWsUrl: 'ws://localhost:9222/devtools/page/1',
+      refs: {
+        '1': { backendDOMNodeId: 1234 },
+      },
+    },
+  };
+  const fakeSend = async (wsUrl, method, params) => {
+    if (method === 'DOM.resolveNode') {
+      return { object: { objectId: 'obj-1' } };
+    }
+    if (method === 'DOM.getBoxModel') {
+      return { model: { content: [10, 20, 30, 20, 30, 40, 10, 40] } };
+    }
+    throw new Error(`Unexpected method: ${method}`);
+  };
+
+  const result = await resolveRef('ui', '1', {
+    getSession: (name) => fakeSession[name] || null,
+    cdpSend: fakeSend,
+    debugLog: (...args) => logs.push(args.join(' ')),
+    debugEnabled: true,
+  });
+
+  assert.strictEqual(result.objectId, 'obj-1');
+  assert.ok(logs.some(line => line.includes('resolveRef start')));
+  assert.ok(logs.some(line => line.includes('backendDOMNodeId=1234')));
+  assert.ok(logs.some(line => line.includes('objectId=obj-1')));
+  assert.ok(logs.some(line => line.includes('center=(20,30)')));
 });
 
 console.log('\nsnapshot diff logic:');
