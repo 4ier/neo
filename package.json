@@ -1,6 +1,6 @@
 {
   "name": "@4ier/neo",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "Turn any website into an AI-callable API. Passive traffic capture, API schema generation, and execution.",
   "type": "module",
   "scripts": {
