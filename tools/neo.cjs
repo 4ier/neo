@@ -39,7 +39,9 @@
 //   neo cookies clear [domain]              Clear cookies
 //   neo snapshot [-i] [-C] [--json] [--diff] Snapshot a11y tree with compact ref mapping
 //   neo click <ref> [--new-tab]             Click element by ref
+//   neo click-xy <x> <y>                     Click at absolute viewport coordinates (bypasses a11y tree)
 //   neo fill <ref> "text"                    Clear then fill element by ref
+//   neo eval-val <selector> <value>          Set input value via framework-safe native setter
 //   neo type <ref> "text"                    Type text without clearing
 //   neo press <key>                          Press keyboard key (supports Ctrl+a)
 //   neo hover <ref>                          Hover over element by ref
@@ -1522,6 +1524,39 @@ const PRESS_KEY_MAP = {
   pageup: { key: 'PageUp', code: 'PageUp' },
   pagedown: { key: 'PageDown', code: 'PageDown' },
 };
+
+function buildClickXyEvents(x, y) {
+  const nx = Number(x);
+  const ny = Number(y);
+  if (!Number.isFinite(nx) || !Number.isFinite(ny)) {
+    throw new Error('click-xy: x and y must be finite numbers');
+  }
+  const base = { x: nx, y: ny, button: 'left', clickCount: 1 };
+  return [
+    { ...base, type: 'mousePressed' },
+    { ...base, type: 'mouseReleased' },
+  ];
+}
+
+function buildEvalValExpression(selector, value) {
+  const selJson = JSON.stringify(String(selector));
+  const valJson = JSON.stringify(String(value == null ? '' : value));
+  return `(function(){
+  var el = document.querySelector(${selJson});
+  if (!el) return { ok: false, error: 'not_found' };
+  var tag = (el.tagName || '').toLowerCase();
+  var proto;
+  if (tag === 'textarea') proto = HTMLTextAreaElement.prototype;
+  else if (tag === 'select') proto = HTMLSelectElement.prototype;
+  else proto = HTMLInputElement.prototype;
+  var setter = Object.getOwnPropertyDescriptor(proto, 'value');
+  if (!setter || typeof setter.set !== 'function') return { ok: false, error: 'no_setter' };
+  setter.set.call(el, ${valJson});
+  el.dispatchEvent(new Event('input', { bubbles: true }));
+  el.dispatchEvent(new Event('change', { bubbles: true }));
+  return { ok: true, tag: tag };
+})()`;
+}
 
 function parsePressKey(rawKey) {
   const input = String(rawKey || '').trim();
@@ -4581,6 +4616,31 @@ commands.click = async function(args, context = {}) {
   console.log(`Clicked ${ref}`);
 };
 
+// neo click-xy <x> <y>
+// Bypass the a11y tree entirely and click at absolute viewport coordinates via
+// CDP Input.dispatchMouseEvent. Useful when resolveRef fails (stale objectId,
+// portal/popover options, elements inside shadow DOM / cross-origin iframes).
+commands['click-xy'] = async function(args, context = {}) {
+  const { positional } = parseArgs(args || []);
+  if (positional.length !== 2) {
+    console.error('Usage: neo click-xy <x> <y>');
+    process.exit(1);
+  }
+  let events;
+  try {
+    events = buildClickXyEvents(positional[0], positional[1]);
+  } catch (err) {
+    console.error(`Usage: neo click-xy <x> <y> (${err && err.message ? err.message : String(err)})`);
+    process.exit(1);
+  }
+
+  const sessionName = context.sessionName || DEFAULT_SESSION_NAME;
+  const pageWsUrl = getSessionPageWsUrl(sessionName);
+  await cdpSend(pageWsUrl, 'Input.dispatchMouseEvent', events[0]);
+  await cdpSend(pageWsUrl, 'Input.dispatchMouseEvent', events[1]);
+  console.log(`Clicked (${events[0].x}, ${events[0].y})`);
+};
+
 // neo fill <ref> "text"
 commands.fill = async function(args, context = {}) {
   const { positional } = parseArgs(args || []);
@@ -4622,6 +4682,34 @@ commands.fill = async function(args, context = {}) {
   });
   await cdpSend(pageWsUrl, 'Input.insertText', { text });
   console.log(`Filled ${ref}`);
+};
+
+// neo eval-val <selector> <value>
+// Set an input/textarea/select value using the framework-safe native setter
+// pattern (React/Vue/Angular controlled inputs ignore naive .value = x).
+commands['eval-val'] = async function(args, context = {}) {
+  const { positional } = parseArgs(args || []);
+  const selector = positional[0];
+  const value = positional.length > 1 ? positional.slice(1).join(' ') : null;
+  if (!selector || value === null) {
+    console.error('Usage: neo eval-val <selector> <value>');
+    process.exit(1);
+  }
+
+  const sessionName = context.sessionName || DEFAULT_SESSION_NAME;
+  const pageWsUrl = getSessionPageWsUrl(sessionName);
+  const expression = buildEvalValExpression(selector, value);
+  const res = await cdpSend(pageWsUrl, 'Runtime.evaluate', {
+    expression,
+    returnByValue: true,
+  });
+  const out = res && res.result && res.result.value;
+  if (!out || !out.ok) {
+    const reason = out && out.error ? out.error : 'unknown';
+    console.error(`eval-val failed (${reason}) for selector: ${selector}`);
+    process.exit(1);
+  }
+  console.log(`Set value on ${selector}`);
 };
 
 // neo type <ref> "text"
@@ -7510,7 +7598,9 @@ Commands:
   neo cookies list|export|import|clear     Manage browser cookies in the active session
   neo snapshot [-i] [-C] [--json] [--diff] Snapshot a11y tree with compact refs
   neo click <ref> [--new-tab]             Click element by ref
+  neo click-xy <x> <y>                     Click at absolute viewport coordinates (bypasses a11y tree)
   neo fill <ref> "text"                    Clear then fill element by ref
+  neo eval-val <selector> <value>          Set input value via framework-safe native setter
   neo type <ref> "text"                    Type text without clearing
   neo press <key>                          Press keyboard key (supports Ctrl+a)
   neo hover <ref>                          Hover over element by ref

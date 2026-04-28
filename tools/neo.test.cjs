@@ -992,6 +992,39 @@ const PRESS_KEY_MAP = {
   pagedown: { key: 'PageDown', code: 'PageDown' },
 };
 
+function buildClickXyEvents(x, y) {
+  const nx = Number(x);
+  const ny = Number(y);
+  if (!Number.isFinite(nx) || !Number.isFinite(ny)) {
+    throw new Error('click-xy: x and y must be finite numbers');
+  }
+  const base = { x: nx, y: ny, button: 'left', clickCount: 1 };
+  return [
+    { ...base, type: 'mousePressed' },
+    { ...base, type: 'mouseReleased' },
+  ];
+}
+
+function buildEvalValExpression(selector, value) {
+  const selJson = JSON.stringify(String(selector));
+  const valJson = JSON.stringify(String(value == null ? '' : value));
+  return `(function(){
+  var el = document.querySelector(${selJson});
+  if (!el) return { ok: false, error: 'not_found' };
+  var tag = (el.tagName || '').toLowerCase();
+  var proto;
+  if (tag === 'textarea') proto = HTMLTextAreaElement.prototype;
+  else if (tag === 'select') proto = HTMLSelectElement.prototype;
+  else proto = HTMLInputElement.prototype;
+  var setter = Object.getOwnPropertyDescriptor(proto, 'value');
+  if (!setter || typeof setter.set !== 'function') return { ok: false, error: 'no_setter' };
+  setter.set.call(el, ${valJson});
+  el.dispatchEvent(new Event('input', { bubbles: true }));
+  el.dispatchEvent(new Event('change', { bubbles: true }));
+  return { ok: true, tag: tag };
+})()`;
+}
+
 function parsePressKey(rawKey) {
   const input = String(rawKey || '').trim();
   if (!input) return null;
@@ -2758,6 +2791,50 @@ test('diff reports no changes for identical snapshots', () => {
   assert.strictEqual(added.length, 0);
   assert.strictEqual(removed.length, 0);
   assert.strictEqual(changed.length, 0);
+});
+
+test('buildClickXyEvents produces mousePressed + mouseReleased at given coords', () => {
+  const events = buildClickXyEvents(100, 200);
+  assert.strictEqual(events.length, 2);
+  assert.deepStrictEqual(events[0], { x: 100, y: 200, button: 'left', clickCount: 1, type: 'mousePressed' });
+  assert.deepStrictEqual(events[1], { x: 100, y: 200, button: 'left', clickCount: 1, type: 'mouseReleased' });
+});
+
+test('buildClickXyEvents accepts numeric strings and floats', () => {
+  const events = buildClickXyEvents('44.5', '88');
+  assert.strictEqual(events[0].x, 44.5);
+  assert.strictEqual(events[0].y, 88);
+  assert.strictEqual(events[1].type, 'mouseReleased');
+});
+
+test('buildClickXyEvents rejects non-finite coordinates', () => {
+  assert.throws(() => buildClickXyEvents('abc', 10), /finite numbers/);
+  assert.throws(() => buildClickXyEvents(10, NaN), /finite numbers/);
+  assert.throws(() => buildClickXyEvents(undefined, undefined), /finite numbers/);
+});
+
+test('buildEvalValExpression JSON-escapes selector and value safely', () => {
+  const expr = buildEvalValExpression('#email', 'user@test.com');
+  assert.ok(expr.includes('"#email"'), 'selector JSON-quoted');
+  assert.ok(expr.includes('"user@test.com"'), 'value JSON-quoted');
+  assert.ok(expr.includes('querySelector'), 'uses querySelector');
+  assert.ok(expr.includes("Object.getOwnPropertyDescriptor"), 'uses native setter pattern');
+  assert.ok(expr.includes("new Event('input'"), 'dispatches input');
+  assert.ok(expr.includes("new Event('change'"), 'dispatches change');
+  assert.ok(expr.includes('HTMLInputElement.prototype'), 'includes input proto');
+  assert.ok(expr.includes('HTMLTextAreaElement.prototype'), 'includes textarea proto');
+});
+
+test('buildEvalValExpression escapes quotes and backslashes in value', () => {
+  const expr = buildEvalValExpression('input[name="q"]', 'hello "world" \\n');
+  // JSON.stringify should turn the value into a safely-quoted JS string literal
+  assert.ok(expr.includes(JSON.stringify('input[name="q"]')), 'selector escaped');
+  assert.ok(expr.includes(JSON.stringify('hello "world" \\n')), 'value escaped');
+});
+
+test('buildEvalValExpression coerces null/undefined value to empty string', () => {
+  const expr = buildEvalValExpression('#x', null);
+  assert.ok(expr.includes('""'));
 });
 
 Promise.all(pendingTests)
